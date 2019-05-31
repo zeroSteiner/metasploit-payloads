@@ -66,6 +66,9 @@ HTTP_USER_AGENT = None
 HTTP_COOKIE = None
 HTTP_HOST = None
 HTTP_REFERER = None
+LOG_LEVEL_DEBUG = 1000
+LOG_LEVEL_INFO = 2000
+LOG_LEVEL_ERROR = 3000
 PAYLOAD_UUID = ''
 SESSION_GUID = ''
 SESSION_COMMUNICATION_TIMEOUT = 300
@@ -140,6 +143,9 @@ TLV_TYPE_SEEK_WHENCE           = TLV_META_TYPE_UINT    | 70
 TLV_TYPE_SEEK_OFFSET           = TLV_META_TYPE_UINT    | 71
 TLV_TYPE_SEEK_POS              = TLV_META_TYPE_UINT    | 72
 
+TLV_TYPE_LOG_LEVEL             = TLV_META_TYPE_UINT    | 80
+TLV_TYPE_LOG_SIZE              = TLV_META_TYPE_UINT    | 81
+
 TLV_TYPE_EXCEPTION_CODE        = TLV_META_TYPE_UINT    | 300
 TLV_TYPE_EXCEPTION_STRING      = TLV_META_TYPE_STRING  | 301
 
@@ -183,6 +189,8 @@ PACKET_LENGTH_OFF = (PACKET_XOR_KEY_SIZE + PACKET_SESSION_GUID_SIZE +
         PACKET_ENCRYPT_FLAG_SIZE)
 PACKET_HEADER_SIZE = (PACKET_XOR_KEY_SIZE + PACKET_SESSION_GUID_SIZE +
         PACKET_ENCRYPT_FLAG_SIZE + PACKET_LENGTH_SIZE + PACKET_TYPE_SIZE)
+
+_log_channels = set()
 
 class SYSTEM_INFO(ctypes.Structure):
     _fields_ = [("wProcessorArchitecture", ctypes.c_uint16),
@@ -241,13 +249,20 @@ def crc16(data):
 def debug_print(msg):
     if DEBUGGING:
         print(msg)
+    for channel in _log_channels:
+        channel.log_debug(msg + '\n')
 
 @export
 def debug_traceback(msg=None):
+    formatted = ''
+    if msg:
+        formatted += msg + '\n'
+    formatted += traceback.format_exc()
     if DEBUGGING:
-        if msg:
-            print(msg)
-        traceback.print_exc(file=sys.stderr)
+        sys.stderr.write(formatted)
+    for channel in _log_channels:
+        channel.log_error(formatted)
+
 
 @export
 def error_result(exception=None):
@@ -446,6 +461,47 @@ class MeterpreterFile(MeterpreterChannel):
         self.file_obj.write(data)
         return len(data)
 export(MeterpreterFile)
+
+#@export
+class MeterpreterLog(MeterpreterChannel):
+    def __init__(self, level, size):
+        self._buffer = ''
+        self.level = level
+        self.size = size
+        _log_channels.add(self)
+
+    def close(self):
+        _log_channels.remove(self)
+
+    def eof(self):
+        return False
+
+    def read(self, length):
+        chunk = self._buffer[:length]
+        self._buffer = self._buffer[length:]
+        return chunk
+
+    def write(self, data):
+        data = data[-self.size:]
+        cutoff = max(-self.size + (len(self._buffer) + len(data)), 0)
+        self._buffer = self._buffer[-cutoff:]
+        self._buffer += data
+
+    def log_debug(self, message):
+        if self.level > LOG_LEVEL_DEBUG:
+            return
+        self.write(message)
+
+    def log_info(self, message):
+        if self.level > LOG_LEVEL_INFO:
+            return
+        self.write(message)
+
+    def log_error(self, message):
+        if self.level > LOG_LEVEL_ERROR:
+            return
+        self.write(message)
+export(MeterpreterLog)
 
 #@export
 class MeterpreterProcess(MeterpreterChannel):
@@ -951,7 +1007,7 @@ class PythonMeterpreter(object):
         self.transports = [self.transport]
         self.session_expiry_time = SESSION_EXPIRATION_TIMEOUT
         self.session_expiry_end = time.time() + self.session_expiry_time
-        for func in list(filter(lambda x: x.startswith('_core'), dir(self))):
+        for func in list(filter(lambda x: x.startswith('_core_') or x.startswith('_channel_'), dir(self))):
             self.extension_functions[func[1:]] = getattr(self, func)
         self.running = True
 
@@ -1118,6 +1174,13 @@ class PythonMeterpreter(object):
         self.send_packet(tlv_pack_request('core_channel_close', [
             {'type': TLV_TYPE_CHANNEL_ID, 'value': channel_id},
         ]))
+
+    def _channel_open_core_logging(self, request, response):
+        level = packet_get_tlv(request, TLV_TYPE_LOG_LEVEL).get('value', LOG_LEVEL_DEBUG)
+        size = packet_get_tlv(request, TLV_TYPE_LOG_SIZE).get('value', 0x2000)
+        channel_id = self.add_channel(MeterpreterLog(level, size))
+        response += tlv_pack(TLV_TYPE_CHANNEL_ID, channel_id)
+        return ERROR_SUCCESS, response
 
     def _core_set_uuid(self, request, response):
         new_uuid = packet_get_tlv(request, TLV_TYPE_UUID)
