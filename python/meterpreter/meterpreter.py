@@ -482,10 +482,8 @@ class MeterpreterLog(MeterpreterChannel):
         return chunk
 
     def write(self, data):
-        data = data[-self.size:]
-        cutoff = max(-self.size + (len(self._buffer) + len(data)), 0)
-        self._buffer = self._buffer[-cutoff:]
         self._buffer += data
+        self._buffer = self._buffer[-self.size:]
 
     def log_debug(self, message):
         if self.level > LOG_LEVEL_DEBUG:
