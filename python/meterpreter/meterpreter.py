@@ -995,41 +995,45 @@ class UdpTransport(Transport):
             return False
         hello = self._parse_header(sock.recv(4))
         if hello is None:
-            debug_print('  failed due to hello being None')
+            debug_print('  dgram stream synchronization failed (missing data)')
             return False
         if hello['version'] != self.DGRAM_STREAM_VERSION:
-            debug_print('  failed due to bad version')
+            debug_print('  dgram stream synchronization failed (bad version, received: ' + str(hello['version']) + ')')
             return False
         if not hello['ack_flag']:
-            debug_print('  failed due to ack flag')
+            debug_print('  dgram stream synchronization failed (missing ack flag)')
             return False
         if hello['sequence'] != sequence:
-            debug_print('  failed due to bad sequence')
+            debug_print('  dgram stream synchronization failed (bad sequence)')
             return False
-        self.sequence = sequence
+        self.sequence = sequence + 1
         self.communication_last = time.time()
         debug_print('[+] synchronized the dgram stream')
         return True
 
     def __recv(self, size):
         if size > len(self._buffer):
-            self._buffer += self.__recv_data()
+            header, data = self.__recv_data()
+            if header is None:
+                return bytes()
+            if not (header['psh_flag'] and header['sequence'] == self.sequence):
+                return bytes()
+            self.socket.send(struct.pack('>BI', 0x12, self.sequence << 8)[:4])
+            self._buffer += data
+            self.sequence += 1
+            print('set sequence to: ' + hex(self.sequence))
         result = self._buffer[:size]
         self._buffer = self._buffer[size:]
         return result
 
     def __recv_data(self):
         frame = self.socket.recv(self._frame_size)
-        if len(frame) < 5:
-            return bytes()
+        if len(frame) < 4:
+            return None, bytes()
         header = self._parse_header(frame[:4])
         if header['version'] != self.DGRAM_STREAM_VERSION:
-            return bytes()
-        if not (header['psh_flag'] and header['sequence'] == (self.sequence + 1)):
-            return bytes()
-        self.sequence += 1
-        self.socket.send(struct.pack('>BI', 0x12, self.sequence << 8)[:4])
-        return frame[4:]
+            return None, bytes()
+        return header, frame[4:]
 
     def _get_packet(self):
         first = self._first_packet
@@ -1087,22 +1091,22 @@ class UdpTransport(Transport):
 
     def __send(self, payload):
         sequence = self.sequence
-        if sequence == 0xffffff:
-            sequence = 1
-        else:
-            sequence += 1
         header = struct.pack('>BI', 0x14, sequence << 8)[:4]
         self.socket.send(header + payload)
         if not select.select([self.socket], [], [], self.communication_timeout)[0]:
+            print('  send failed for sequence (' + hex(sequence) + ') (read timeed out)')
             return False
-        resp = self._parse_header(self.socket.recv(4))
-        if resp['version'] != self.DGRAM_STREAM_VERSION:
+        header, data = self.__recv_data()
+        if header is None:
             return False
-        if not resp['ack_flag']:
+        if header['sequence'] != sequence:
+            print('  send failed for sequence (' + hex(sequence) + ') (bad sequence, received: ' + hex(header['sequence']) + ')')
             return False
-        if resp['sequence'] != sequence:
+        if not header['ack_flag']:
+            print('  send failed for sequence (' + hex(sequence) + ') (missing ack flag)')
             return False
-        self.sequence = sequence
+        self.sequence += 1
+        print('set sequence to: ' + hex(self.sequence))
         return True
 
     @classmethod
