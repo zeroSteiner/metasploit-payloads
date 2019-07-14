@@ -940,6 +940,13 @@ class UdpTransport(Transport):
         self._frame_size = 65507
         self._buffer = bytes()
 
+    def __increment_sequence(self):
+        self.sequence += 1
+        if self.sequence == 0x1000000:
+            self.sequence = 1
+        # todo: remove this when finished debugging
+        print("set dgram stream sequence to: 0x{0:06x} ({0})".format(self.sequence))
+
     def _activate(self):
         address, port = self.url[6:].rsplit(':', 1)
         port = int(port.rstrip('/'))
@@ -978,10 +985,10 @@ class UdpTransport(Transport):
             return None
         flags, hi_seq, lo_seq = struct.unpack('>BBH', header)
         parsed = dict(
-            version=(flags & 0xf0) >> 4,
-            psh_flag=(flags & 0b0100) != 0,
-            ack_flag=(flags & 0b0010) != 0,
-            syn_flag=(flags & 0b0001) != 0,
+            version =(flags & 0b11110000) >> 4,
+            psh_flag=(flags & 0b00000100) != 0,
+            ack_flag=(flags & 0b00000010) != 0,
+            syn_flag=(flags & 0b00000001) != 0,
             sequence=(hi_seq << 16) | lo_seq
         )
         return parsed
@@ -1020,8 +1027,7 @@ class UdpTransport(Transport):
                 return bytes()
             self.socket.send(struct.pack('>BI', 0x12, self.sequence << 8)[:4])
             self._buffer += data
-            self.sequence += 1
-            print('set sequence to: ' + hex(self.sequence))
+            self.__increment_sequence()
         result = self._buffer[:size]
         self._buffer = self._buffer[size:]
         return result
@@ -1105,8 +1111,7 @@ class UdpTransport(Transport):
         if not header['ack_flag']:
             print('  send failed for sequence (' + hex(sequence) + ') (missing ack flag)')
             return False
-        self.sequence += 1
-        print('set sequence to: ' + hex(self.sequence))
+        self.__increment_sequence()
         return True
 
     @classmethod
