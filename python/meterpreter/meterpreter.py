@@ -349,6 +349,7 @@ COMMAND_IDS = (
     (1116, 'stdapi_audio_mic_stop'),
     (1117, 'stdapi_audio_mic_list'),
     (1118, 'stdapi_sys_process_set_term_size'),
+    (19001, 'foobar_echo'),
 
 )
 # ---------------------------------------------------------------
